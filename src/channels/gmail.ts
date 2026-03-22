@@ -28,6 +28,23 @@ interface ThreadMeta {
   messageId: string; // RFC 2822 Message-ID for In-Reply-To
 }
 
+// Patterns matching common prompt injection attempts.
+// Only checked for non-allowlisted senders (trusted senders bypass this).
+const SUSPICIOUS_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+)?previous\s+instructions/i,
+  /ignore\s+(all\s+)?prior\s+instructions/i,
+  /you\s+are\s+now\b/i,
+  /your\s+new\s+(instructions|role|purpose)\b/i,
+  /system\s*prompt/i,
+  /act\s+as\s+(a\s+)?different/i,
+  /disregard\s+(all\s+)?(previous|prior|above)/i,
+  /override\s+(your|the)\s+(instructions|rules|constraints)/i,
+  /pretend\s+(you\s+are|to\s+be)\b/i,
+  /do\s+not\s+follow\s+(your|the)\s+(rules|instructions)/i,
+  /\bDAN\b.*\bjailbreak/i,
+  /bypass\s+(your|the)\s+(safety|security|restrictions)/i,
+];
+
 export class GmailChannel implements Channel {
   name = 'gmail';
 
@@ -40,10 +57,24 @@ export class GmailChannel implements Channel {
   private threadMeta = new Map<string, ThreadMeta>();
   private consecutiveErrors = 0;
   private userEmail = '';
+  private allowedSenders: Set<string> | null = null; // null = no filtering
 
   constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
     this.pollIntervalMs = pollIntervalMs;
+
+    // Optional sender allowlist: comma-separated emails in GMAIL_ALLOWED_SENDERS.
+    // When set, only listed addresses are processed; others are marked read silently.
+    const allowedRaw = process.env.GMAIL_ALLOWED_SENDERS?.trim();
+    if (allowedRaw) {
+      this.allowedSenders = new Set(
+        allowedRaw.split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
+      );
+      logger.info(
+        { count: this.allowedSenders.size },
+        'Gmail sender allowlist enabled',
+      );
+    }
   }
 
   async connect(): Promise<void> {
@@ -177,6 +208,24 @@ export class GmailChannel implements Channel {
 
   // --- Private ---
 
+  /** Returns true if no allowlist is configured or if the sender is in it. */
+  private isSenderAllowed(email: string): boolean {
+    if (!this.allowedSenders) return true;
+    return this.allowedSenders.has(email.toLowerCase());
+  }
+
+  /** Returns the first matching injection pattern, or null if clean. */
+  private detectSuspiciousContent(
+    subject: string,
+    body: string,
+  ): RegExp | null {
+    const combined = `${subject}\n${body}`;
+    for (const pattern of SUSPICIOUS_PATTERNS) {
+      if (pattern.test(combined)) return pattern;
+    }
+    return null;
+  }
+
   private buildQuery(): string {
     return 'is:unread category:primary';
   }
@@ -245,8 +294,51 @@ export class GmailChannel implements Channel {
     // Skip emails from self (our own replies)
     if (senderEmail === this.userEmail) return;
 
+    const senderTrusted = this.isSenderAllowed(senderEmail);
+
+    // If allowlist is active and sender isn't on it, mark as read and skip
+    if (!senderTrusted) {
+      logger.debug(
+        { from: senderEmail, subject },
+        'Gmail: sender not in allowlist, marking as read',
+      );
+      try {
+        await this.gmail.users.messages.modify({
+          userId: 'me',
+          id: messageId,
+          requestBody: { removeLabelIds: ['UNREAD'] },
+        });
+      } catch (err) {
+        logger.warn({ messageId, err }, 'Failed to mark non-allowlisted email as read');
+      }
+      return;
+    }
+
     // Extract body text
     const body = this.extractTextBody(msg.data.payload);
+
+    // Prompt injection detection: check when no allowlist is configured (all senders
+    // get through) or for non-allowlisted senders. Trusted senders (explicitly in
+    // the allowlist) bypass this check — they may discuss technical topics that match.
+    if (!this.allowedSenders) {
+      const suspiciousPattern = this.detectSuspiciousContent(subject, body);
+      if (suspiciousPattern) {
+        logger.warn(
+          { from: senderEmail, subject, pattern: suspiciousPattern.source },
+          'Gmail: suspicious content detected, skipping email',
+        );
+        try {
+          await this.gmail!.users.messages.modify({
+            userId: 'me',
+            id: messageId,
+            requestBody: { removeLabelIds: ['UNREAD'] },
+          });
+        } catch (err) {
+          logger.warn({ messageId, err }, 'Failed to mark suspicious email as read');
+        }
+        return;
+      }
+    }
 
     if (!body) {
       logger.debug({ messageId, subject }, 'Skipping email with no text body');
@@ -320,12 +412,29 @@ export class GmailChannel implements Channel {
       return Buffer.from(payload.body.data, 'base64').toString('utf-8');
     }
 
+    // Direct text/html fallback: strip tags when no plain text part exists
+    if (payload.mimeType === 'text/html' && payload.body?.data) {
+      return Buffer.from(payload.body.data, 'base64')
+        .toString('utf-8')
+        .replace(/<[^>]*>/g, '')
+        .trim();
+    }
+
     // Multipart: search parts recursively
     if (payload.parts) {
       // Prefer text/plain
       for (const part of payload.parts) {
         if (part.mimeType === 'text/plain' && part.body?.data) {
           return Buffer.from(part.body.data, 'base64').toString('utf-8');
+        }
+      }
+      // Fallback to text/html with tag stripping
+      for (const part of payload.parts) {
+        if (part.mimeType === 'text/html' && part.body?.data) {
+          return Buffer.from(part.body.data, 'base64')
+            .toString('utf-8')
+            .replace(/<[^>]*>/g, '')
+            .trim();
         }
       }
       // Recurse into nested multipart
